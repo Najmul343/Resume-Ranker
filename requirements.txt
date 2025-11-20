@@ -1,0 +1,10 @@
+streamlit
+groq
+PyPDF2
+pandas
+pdf2image
+pytesseract
+sentence-transformers
+faiss-cpu
+torch
+pillow
