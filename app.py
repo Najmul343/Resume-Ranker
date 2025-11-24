@@ -1,132 +1,144 @@
 """
-Production-ready Streamlit app: Elite Resume Ranker
-Improvements vs original:
-- Robust PDF/text extraction with clear fallbacks and logging
-- Safe ZIP handling (file count / size limits)
-- Regex word-boundary keyword matching
-- Proper boost parsing (regex)
-- FAISS usage with normalized float32 embeddings
-- Optional weighting of boost terms in semantic search
-- Resume summarization before LLM scoring to save tokens
-- Robust LLM response parsing with retries
-- Tesseract auto-detect fallback
-- Caching for embedder
-- Progress and user-friendly spinners/messages
+Ultra-fast production-ready Streamlit app: Elite Resume Ranker — Optimized
+
+Key optimizations applied:
+- pypdf for fast text extraction (first N pages only)
+- OCR used ONLY when PyPDF extraction returns empty
+- Controlled thread pools for IO vs network
+- Embedding caching with st.cache_resource for repeated runs
+- Summarization before embedding (short snippets)
+- FAISS HNSW index for fast approximate search
+- Batch LLM scoring (5 resumes per prompt) to reduce RPCs
+- Safe ZIP handling (file count/size limits)
+- Minimal on-screen logging; use Python logging for debug
 
 Notes:
-- Expects GROQ_API_KEY in Streamlit secrets.toml as before.
-- Tune THREAD_COUNTS and limits for your deployment environment.
+- Requires GROQ_API_KEY in Streamlit secrets.toml for LLM scoring.
+- Tweak THREAD counts and batch sizes according to your deployment (CPU vs GPU).
+
 """
 
 import streamlit as st
-import PyPDF2, re, io, zipfile, pandas as pd, base64, numpy as np, os, math
-from pdf2image import convert_from_bytes
-import pytesseract
-from groq import Groq
+import io, zipfile, re, time, os, math, base64
+from typing import List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+import numpy as np
+
+# Fast PDF reader
+try:
+    from pypdf import PdfReader
+except Exception:
+    from PyPDF2 import PdfReader  # fallback
+
+# OCR (only used as last resort)
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+except Exception:
+    convert_from_bytes = None
+    pytesseract = None
+
+# Embeddings + FAISS
 from sentence_transformers import SentenceTransformer
 import faiss
-import time
-import textwrap
-from typing import List, Tuple
+
+# LLM client (Groq)
+from groq import Groq
+
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # ========================= CONFIG =========================
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", None)
-if not GROQ_API_KEY:
-    st.warning("GROQ_API_KEY missing in secrets.toml — LLM scoring will be disabled.")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
 MODEL = "llama-3.1-8b-instant"
 
-# Tunables
+# Tunables — adjust for your infra
 MAX_ZIP_FILES = 800
-MAX_ZIP_BYTES = 250 * 1024 * 1024  # 250 MB
-EXTRACTION_THREADS = 8  # tune per CPU
-LLM_THREADS = 8
+MAX_ZIP_BYTES = 300 * 1024 * 1024  # 300 MB
+EXTRACTION_THREADS = 12
+LLM_THREADS = 6
 MAX_CANDIDATES = 220
-FINAL_LLM_TOP = 130
-SUMMARY_CHAR_LIMIT = 2500  # summarise resume to ~2500 chars for LLM scoring
+FINAL_LLM_TOP = 120
+SUMMARY_CHAR_LIMIT = 1800  # small summaries for embedding + LLM
+EMBED_BATCH = 64
+EMBED_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
+HNSW_M = 32
+BATCH_LLM_SIZE = 5  # resumes per LLM batch prompt
+PAGES_TO_EXTRACT = 3  # only first N pages
 
-# Auto-detect tesseract
-try:
-    if not pytesseract.get_tesseract_version():
-        pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-except Exception:
-    # best-effort; let pytesseract raise later when used
-    pass
+st.set_page_config(page_title="Elite Resume Ranker — Ultra-fast", layout="wide")
+st.title("⚡ Elite Resume Ranker — Ultra-fast")
+st.caption("Optimized pipeline: fast extraction → cached embeddings → HNSW FAISS → batched LLM scoring")
 
-st.set_page_config(page_title="Elite Resume Ranker — Production", layout="wide")
-st.title("⚡ Elite Resume Ranker — Production-ready")
-st.markdown("**Improved reliability, safety, and cost-efficiency**")
-
-# ========================= HELPERS & CACHES =========================
+# ========================= CACHES & HELPERS =========================
 @st.cache_resource
-def load_embedder(model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
+def get_embedder(model_name: str = EMBED_MODEL):
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Loading embedder on {device}")
     return SentenceTransformer(model_name, device=device)
 
-embedder = load_embedder()
+embedder = get_embedder()
 
-def safe_read_zip(file) -> List[Tuple[str, bytes]]:
-    """Reads zip file contents but enforces file count and size limits to avoid ZIP bombs."""
-    file.seek(0)
-    data = file.read()
+@st.cache_resource
+def embed_texts(texts: Tuple[str]):
+    # accept tuple to be cacheable
+    emb = embedder.encode(list(texts), batch_size=EMBED_BATCH, show_progress_bar=False, normalize_embeddings=True)
+    return np.array(emb, dtype='float32')
+
+
+def safe_read_zip(uploaded_file) -> List[Tuple[str, bytes]]:
+    uploaded_file.seek(0)
+    data = uploaded_file.read()
     if len(data) > MAX_ZIP_BYTES:
-        raise ValueError(f"Uploaded zip exceeds maximum allowed size of {MAX_ZIP_BYTES//1024//1024} MB")
+        raise ValueError(f"ZIP size exceeds {MAX_ZIP_BYTES//1024//1024} MB")
     buf = io.BytesIO(data)
     with zipfile.ZipFile(buf) as z:
         names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
         if len(names) > MAX_ZIP_FILES:
-            raise ValueError(f"Too many PDF files in ZIP ({len(names)}). Max allowed is {MAX_ZIP_FILES}.")
+            raise ValueError(f"Too many PDFs in ZIP ({len(names)}). Limit {MAX_ZIP_FILES}.")
         items = [(n, z.read(n)) for n in names]
     return items
 
 
-def extract_text(pdf_bytes: bytes, ocr_first_page_only: bool = True) -> str:
-    """Try: 1) PyPDF2 text extraction 2) If short or empty -> OCR first page 3) return truncated text"""
+def fast_pdf_text(pdf_bytes: bytes, pages: int = PAGES_TO_EXTRACT) -> str:
+    """Extract text from first N pages using pypdf/PyPDF2. If no text and OCR available, OCR first page only."""
     text = ""
     try:
-        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        for p in reader.pages:
-            # some pages may return None
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        # pypdf and PyPDF2 both expose .pages
+        for p in reader.pages[:pages]:
             pg = p.extract_text()
             if pg:
                 text += pg + "\n"
         text = re.sub(r'\s+', ' ', text).strip()
-        # if sufficient text extracted, return
-        if len(text) > 300:
-            return text[:24000]
     except Exception as e:
-        # log silently and fallback to OCR
-        st.write(f"PyPDF2 failed: {e}")
+        logger.info(f"PDF parsing error: {e}")
+        text = ""
 
-    # Fallback: OCR first page
-    try:
-        imgs = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
-        if imgs:
-            text_ocr = pytesseract.image_to_string(imgs[0], config='--psm 6')
-            text_ocr = re.sub(r'\s+', ' ', text_ocr).strip()
-            if text_ocr:
-                # combine with previous if any
-                combined = (text + '\n' + text_ocr).strip()
-                return combined[:24000]
-    except Exception as e:
-        st.write(f"OCR fallback failed: {e}")
+    # Only OCR if extraction returned NOTHING
+    if (not text or len(text.strip()) == 0) and convert_from_bytes and pytesseract:
+        try:
+            imgs = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+            if imgs:
+                text = pytesseract.image_to_string(imgs[0], config='--psm 6')
+                text = re.sub(r'\s+', ' ', text).strip()
+        except Exception as e:
+            logger.info(f"OCR failed: {e}")
+            text = text or ""
 
-    # Final fallback: return whatever we have or explicit marker
-    if not text:
-        return ""  # explicit empty so downstream can detect
     return text[:24000]
 
 
-def parse_keywords(text: str) -> List[str]:
-    return re.findall(r"\w+", text.lower())
+def tokenize(text: str) -> List[str]:
+    return re.findall(r"\w+", (text or "").lower())
 
 
 def keyword_score(text: str, jd_tokens: List[str], boost_tokens: List[str]) -> int:
-    """Score using word-boundary matching; boost tokens weighted higher."""
-    text_low = text.lower()
+    text_low = (text or "").lower()
     score = 0
     for w in set(jd_tokens):
         if re.search(rf"\b{re.escape(w)}\b", text_low):
@@ -137,218 +149,199 @@ def keyword_score(text: str, jd_tokens: List[str], boost_tokens: List[str]) -> i
     return score
 
 
-def summarize_for_llm(text: str, char_limit: int = SUMMARY_CHAR_LIMIT) -> str:
-    """A lightweight summarizer: returns the first useful paragraphs up to limit.
-    (We intentionally keep it simple to avoid extra tokens and complexity.)
-    """
+def summarize(text: str, limit: int = SUMMARY_CHAR_LIMIT) -> str:
     if not text:
         return ""
-    # Prefer the top paragraph blocks separated by two newlines
-    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
     out = ""
-    for p in paragraphs:
-        if len(out) + len(p) + 2 > char_limit:
+    for p in paras:
+        if len(out) + len(p) + 2 > limit:
             break
         out += p + "\n\n"
     if not out:
-        out = text[:char_limit]
+        out = text[:limit]
     return out.strip()
 
+# Robust LLM parsing for batched responses
 
-def robust_parse_score(resp_text: str) -> Tuple[int, str]:
-    """Try to extract score robustly from LLM response."""
-    if not resp_text:
-        return 30, "Empty LLM response"
-    s = resp_text
-    # normalize
-    s_norm = s.replace('\r', '\n')
-    # search for digits near 'score'
-    m = re.search(r'score[^0-9]{0,6}(\d{1,3})', s_norm, re.I)
-    if not m:
-        m = re.search(r'^(\d{1,3})\b', s_norm)
-    if m:
-        try:
-            score = int(m.group(1))
-            score = max(0, min(100, score))
-        except:
-            score = 30
-    else:
-        score = 30
-    # reason extraction
-    reason = ""
-    m2 = re.search(r'reason[:\-\s]{1,20}(.+)', s_norm, re.I | re.S)
-    if m2:
-        reason = m2.group(1).strip().split('\n')[0][:200]
-    else:
-        # fallback: first sentence after score
-        parts = re.split(r'\n', s_norm)
-        if len(parts) > 1:
-            reason = parts[1].strip()[:200]
-        else:
-            reason = s_norm.strip()[:200]
-    return score, reason
+def parse_batch_llm_response(resp: str, count: int) -> Dict[int, Tuple[int, str]]:
+    """Expected formats in response (examples):
+    1: SCORE=85, REASON=Good match
+    or
+    1) SCORE: 85 REASON: Good match
+    Returns mapping idx->(score, reason)
+    """
+    out = {}
+    if not resp:
+        return {i: (30, 'Empty response') for i in range(1, count+1)}
+    lines = [l.strip() for l in re.split(r'\n|\r', resp) if l.strip()]
+    # combine lines that look like entries
+    candidate_text = ' '.join(lines)
+    # try to find patterns like '1: SCORE=85, REASON=...'
+    matches = re.findall(r'(\d+)[\):\.]?\s*(?:score[:=]?\s*(\d{1,3}))?[,;\-\s]+reason[:=]?\s*([^\d]+?)(?=\d+\)|\d+:|$)', candidate_text, re.I)
+    if matches:
+        for m in matches:
+            idx = int(m[0])
+            sc = int(m[1]) if m[1] and m[1].isdigit() else 30
+            reason = m[2].strip()[:250]
+            out[idx] = (max(0, min(100, sc)), reason)
+        # fill missing
+        for i in range(1, count+1):
+            if i not in out:
+                out[i] = (30, 'No parse')
+        return out
+
+    # fallback: look for all numbers and reasons sequentially
+    scores = re.findall(r'\b(\d{1,3})\b', candidate_text)
+    reasons = re.split(r'\b\d{1,3}\b', candidate_text)
+    for i in range(1, count+1):
+        sc = int(scores[i-1]) if i-1 < len(scores) else 30
+        reason = reasons[i][:200].strip() if i <= len(reasons)-1 else ''
+        out[i] = (max(0, min(100, sc)), reason or 'Parsed')
+    return out
 
 
-def call_llm_score(client: Groq, prompt: str, model: str = MODEL, retries: int = 2) -> str:
+def call_llm_batch(client: Groq, jd: str, boost: str, summaries: List[str]) -> Dict[int, Tuple[int, str]]:
+    """Send up to BATCH_LLM_SIZE summaries in one prompt and parse response."""
     if client is None:
-        return ''
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.05,
-                max_tokens=180
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            st.write(f"LLM call failed (attempt {attempt}): {e}")
-            time.sleep(0.8 + attempt * 0.5)
-    return ''
+        # return neutral scores
+        return {i+1: (50, 'LLM disabled') for i in range(len(summaries))}
+    # Build prompt
+    prompt_lines = ["You are an expert recruiter. Score each resume 0-100 and give one short reason."]
+    prompt_lines.append(f"JD: {jd}")
+    if boost:
+        prompt_lines.append(f"BOOST: {boost}")
+    prompt_lines.append("\nRate these resumes. Reply in a numbered list: '1: SCORE=XX, REASON=one short sentence'\n")
+    for i, s in enumerate(summaries, start=1):
+        prompt_lines.append(f"{i}) {s[:1500].replace('\n',' ')}")
+    prompt = '\n'.join(prompt_lines)
 
-# ========================= UI and Main Flow =========================
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.05,
+            max_tokens=400
+        )
+        text = resp.choices[0].message.content
+    except Exception as e:
+        logger.info(f"LLM batch call failed: {e}")
+        text = ''
+    return parse_batch_llm_response(text, len(summaries))
 
+# ========================= UI =========================
 c1, c2 = st.columns([3,1])
 with c1:
     job_desc = st.text_area("Job Description", height=200, placeholder="e.g. Senior Python Engineer, FastAPI, Docker, AWS...")
 with c2:
     boost = st.text_input("Boost keywords (comma separated)", placeholder="FastAPI, Docker, AWS, Redis")
 
-uploaded_zip = st.file_uploader("Upload ZIP of PDF resumes", type="zip")
+uploaded_zip = st.file_uploader("Upload ZIP of PDF resumes", type=["zip"])
 
-if st.button("Start Ranking", type="primary"):
+if st.button("Start (Ultra-fast)"):
     if not job_desc or not job_desc.strip():
-        st.error("Job Description is required.")
+        st.error("Job description required")
         st.stop()
     if not uploaded_zip:
-        st.error("Please upload a ZIP file containing PDF resumes.")
+        st.error("Please upload a ZIP of PDFs")
         st.stop()
 
     try:
         files = safe_read_zip(uploaded_zip)
     except Exception as e:
-        st.error(f"Error reading ZIP: {e}")
+        st.error(f"ZIP error: {e}")
         st.stop()
 
-    st.info(f"Found {len(files)} PDF resumes in ZIP — starting processing.")
+    st.info(f"Processing {len(files)} PDFs — running fast pipeline")
+    start = time.time()
 
-    jd_tokens = parse_keywords(job_desc)
-    boost_tokens = parse_keywords(boost) if boost else []
+    jd_tokens = tokenize(job_desc)
+    boost_tokens = tokenize(boost)
 
-    start_time = time.time()
-
-    # Phase 1: parallel extraction + keyword pre-filter
-    extractor_progress = st.empty()
-    extractor_progress.text("Phase 1: extracting text and keyword filtering...")
-
-    candidates = []
+    # Phase 1: Fast parallel extraction + keyword prefilter
+    extracted = []
     with ThreadPoolExecutor(max_workers=min(EXTRACTION_THREADS, max(2, len(files)))) as ex:
-        futures = {ex.submit(lambda t: (t[0], extract_text(t[1])), item): item[0] for item in files}
-        results = []
+        futures = {ex.submit(fast_pdf_text, data): name for name, data in files}
         for fut in as_completed(futures):
             name = futures[fut]
             try:
-                name, text = fut.result()
+                text = fut.result()
             except Exception as e:
-                st.write(f"Extraction failed for {name}: {e}")
+                logger.info(f"Extraction failed {name}: {e}")
                 text = ""
-            score = keyword_score(text, jd_tokens, boost_tokens) if text else 0
-            results.append((name, text, score))
+            score = keyword_score(text, jd_tokens, boost_tokens)
+            extracted.append((name, text, score))
 
-    # sort by keyword score and keep top N
-    results.sort(key=lambda x: x[2], reverse=True)
-    survivors = results[:MAX_CANDIDATES]
-    extractor_progress.text(f"Phase 1 done — {len(survivors)} survivors. Time: {int(time.time()-start_time)}s")
+    extracted.sort(key=lambda x: x[2], reverse=True)
+    survivors = extracted[:MAX_CANDIDATES]
+    st.write(f"Phase1 done — {len(survivors)} survivors — {int(time.time()-start)}s")
 
-    # Phase 2: semantic ranking using embeddings + FAISS
-    sem_progress = st.empty()
-    sem_progress.text("Phase 2: semantic ranking (embeddings + FAISS)...")
+    # Phase 2: Summarize + embed (cacheable)
+    texts = [s[1] or "" for s in survivors]
+    summaries = [summarize(t) for t in texts]
 
-    texts = [r[1] if r[1] else "" for r in survivors]
-    # Create embeddings in batches
-    try:
-        embeddings = embedder.encode([t if t else "" for t in texts], batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-        embeddings = np.array(embeddings).astype('float32')
-    except Exception as e:
-        st.error(f"Embedding error: {e}")
-        st.stop()
+    # Use cached embedder: embed summaries
+    embeddings = embed_texts(tuple(summaries))
 
+    # Build HNSW index
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
+    index = faiss.IndexHNSWFlat(dim, HNSW_M)
+    index.hnsw.efConstruction = 40
     index.add(embeddings)
 
-    # Query embedding: consider weighting boost tokens by repeating them
-    query_text = job_desc
-    if boost_tokens:
-        # append boost tokens repeated to give them extra weight
-        query_text = job_desc + ' ' + ' '.join(boost_tokens * 3)
+    # Query embedding: emphasize boost by repeating
+    query_text = job_desc + (' ' + boost) * 2 if boost else job_desc
     q_emb = embedder.encode([query_text], normalize_embeddings=True).astype('float32')
-
-    k = min(130, len(survivors))
+    k = min(130, len(summaries))
     D, I = index.search(q_emb, k)
     ranked = [survivors[i] for i in I[0]]
-    sem_progress.text(f"Phase 2 done — semantic top {len(ranked)} selected. Time: {int(time.time()-start_time)}s")
+    st.write(f"Phase2 done — top {len(ranked)} semantic candidates — {int(time.time()-start)}s")
 
-    # Phase 3: Final scoring with LLM (on summarized text to save tokens)
-    llm_progress = st.empty()
-    llm_progress.text("Phase 3: final scoring with LLM (summarized inputs)...")
-
-    # Prepare PDF bytes lookup for download later
-    # Re-open zip to fetch PDFs as bytes for top candidates
+    # Prepare bytes lookup for download
     uploaded_zip.seek(0)
-    zip_buf = io.BytesIO(uploaded_zip.read())
-    with zipfile.ZipFile(zip_buf) as z:
+    buf = io.BytesIO(uploaded_zip.read())
+    with zipfile.ZipFile(buf) as z:
         name_to_bytes = {n: z.read(n) for n in z.namelist() if n.lower().endswith('.pdf')}
 
-    final_items = ranked[:FINAL_LLM_TOP]
-    results_for_df = []
+    # Phase 3: Batched LLM scoring
+    to_score = ranked[:FINAL_LLM_TOP]
+    results = []
+    # prepare batches
+    batches = [to_score[i:i+BATCH_LLM_SIZE] for i in range(0, len(to_score), BATCH_LLM_SIZE)]
 
-    def score_item(name, text):
-        summary = summarize_for_llm(text)
-        prompt = f"""Score 0-100 how well this resume matches the JD. Reply EXACTLY in this format:\nSCORE: <integer 0-100>\nREASON: <one short sentence>\n\nJD: {job_desc}\nBOOST: {boost}\n\nResumeSummary: {summary}\n\nIf you cannot score, return SCORE: 30 and REASON: Unable to evaluate."""
-        resp = call_llm_score(client, prompt)
-        score, reason = robust_parse_score(resp)
-        return score, reason
+    for batch_idx, batch in enumerate(batches, start=1):
+        batch_summaries = [summarize(item[1]) for item in batch]
+        res_map = call_llm_batch(client, job_desc, boost, batch_summaries)
+        # parse and attach
+        for i, item in enumerate(batch, start=1):
+            name, text, _ = item
+            sc, reason = res_map.get(i, (30, 'No score'))
+            pdfb = name_to_bytes.get(name, b"")
+            results.append({"File": name, "Score": sc, "Why": reason, "PDF": pdfb})
+        st.write(f"Batched LLM: processed batch {batch_idx}/{len(batches)}")
 
-    # Use ThreadPoolExecutor but limit concurrency to control API usage
-    with ThreadPoolExecutor(max_workers=min(LLM_THREADS, max(1, len(final_items)))) as ex:
-        future_to_name = {ex.submit(score_item, itm[0], itm[1]): itm[0] for itm in final_items}
-        for fut in as_completed(future_to_name):
-            name = future_to_name[fut]
-            try:
-                score, reason = fut.result()
-            except Exception as e:
-                st.write(f"LLM scoring failed for {name}: {e}")
-                score, reason = 30, "LLM error"
-            pdf_bytes = name_to_bytes.get(name, b"")
-            results_for_df.append({"File": name, "Score": score, "Why": reason, "PDF": pdf_bytes})
-
-    df = pd.DataFrame(results_for_df).sort_values("Score", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(results).sort_values('Score', ascending=False).reset_index(drop=True)
     if df.empty:
-        st.error("No scored resumes — nothing to show.")
+        st.warning('No results')
         st.stop()
+    df['Rank'] = range(1, len(df)+1)
 
-    df["Rank"] = range(1, len(df) + 1)
+    st.success(f"Done in {int(time.time()-start)}s — Top: {df.iloc[0]['File']} ({df.iloc[0]['Score']})")
 
-    st.success(f"Done in {int(time.time()-start_time)} seconds — Top: {df.iloc[0]['File']} ({df.iloc[0]['Score']})")
+    def link(n,d):
+        return f'<a href="data:application/pdf;base64,{base64.b64encode(d).decode()}" download="{n}">{n}</a>'
 
-    def link(n, d):
-        return f'<a href="data:application/pdf;base64,{base64.b64encode(d).decode()}" download="{n}" style="color:#0066cc;font-weight:600;">{n}</a>'
+    df['Candidate'] = df.apply(lambda r: link(r['File'], r['PDF']), axis=1)
+    st.markdown(df[['Rank','Candidate','Score','Why']].to_html(escape=False, index=False), unsafe_allow_html=True)
 
-    df["Candidate"] = df.apply(lambda r: link(r["File"], r["PDF"]), axis=1)
-
-    st.markdown(df[["Rank", "Candidate", "Score", "Why"]].to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # Download top N
-    TOP_N = 20
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        for _, r in df.head(TOP_N).iterrows():
-            name = f"{int(r['Score']):03d}_{r['File']}"
-            z.writestr(name, r['PDF'])
-    buf.seek(0)
-    st.download_button("📥 Download Top 20 Ranked Resumes", buf, "TOP20_FINAL.zip", "application/zip", use_container_width=True)
+    # Download top 20
+    outbuf = io.BytesIO()
+    with zipfile.ZipFile(outbuf, 'w') as z:
+        for _, r in df.head(20).iterrows():
+            z.writestr(f"{int(r['Score']):03d}_{r['File']}", r['PDF'])
+    outbuf.seek(0)
+    st.download_button('📥 Download Top 20', outbuf, 'top20.zip', 'application/zip')
 
     st.balloons()
 
-# End of app
+# End
