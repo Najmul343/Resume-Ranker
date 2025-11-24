@@ -99,7 +99,7 @@ def extract_text(pdf_bytes: bytes, ocr_first_page_only: bool = True) -> str:
             return text[:24000]
     except Exception as e:
         # log silently and fallback to OCR
-        st.debug(f"PyPDF2 failed: {e}")
+        st.write(f"PyPDF2 failed: {e}")
 
     # Fallback: OCR first page
     try:
@@ -112,7 +112,7 @@ def extract_text(pdf_bytes: bytes, ocr_first_page_only: bool = True) -> str:
                 combined = (text + '\n' + text_ocr).strip()
                 return combined[:24000]
     except Exception as e:
-        st.debug(f"OCR fallback failed: {e}")
+        st.write(f"OCR fallback failed: {e}")
 
     # Final fallback: return whatever we have or explicit marker
     if not text:
@@ -202,7 +202,7 @@ def call_llm_score(client: Groq, prompt: str, model: str = MODEL, retries: int =
             )
             return resp.choices[0].message.content
         except Exception as e:
-            st.debug(f"LLM call failed (attempt {attempt}): {e}")
+            st.write(f"LLM call failed (attempt {attempt}): {e}")
             time.sleep(0.8 + attempt * 0.5)
     return ''
 
@@ -250,7 +250,7 @@ if st.button("Start Ranking", type="primary"):
             try:
                 name, text = fut.result()
             except Exception as e:
-                st.debug(f"Extraction failed for {name}: {e}")
+                st.write(f"Extraction failed for {name}: {e}")
                 text = ""
             score = keyword_score(text, jd_tokens, boost_tokens) if text else 0
             results.append((name, text, score))
@@ -318,7 +318,7 @@ if st.button("Start Ranking", type="primary"):
             try:
                 score, reason = fut.result()
             except Exception as e:
-                st.debug(f"LLM scoring failed for {name}: {e}")
+                st.write(f"LLM scoring failed for {name}: {e}")
                 score, reason = 30, "LLM error"
             pdf_bytes = name_to_bytes.get(name, b"")
             results_for_df.append({"File": name, "Score": score, "Why": reason, "PDF": pdf_bytes})
