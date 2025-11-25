@@ -1,8 +1,7 @@
-streamlit>=1.30.0
-pymupdf>=1.23.0
-sentence-transformers>=2.2.2
-pandas>=1.5.0
-faiss-cpu>=1.7.4
-groq>=0.4.0
-numpy>=1.21.0
-base64io
+streamlit
+pymupdf
+sentence-transformers
+pandas
+faiss-cpu
+groq
+numpy
