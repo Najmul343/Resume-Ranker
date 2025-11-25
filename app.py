@@ -48,19 +48,23 @@ def extract_text(path):
         with fitz.open(path) as doc:
             text = "".join(p.get_text() for p in doc)
             return text[-22_000:], text
-    except: return "", ""
+    except:
+        return "", ""
 
 def has_all_keywords(text, kws):
-    if not kws: return True
-    t = text lower()
+    if not kws:
+        return True
+    t = text.lower()  # ← FIXED: was "text lower()"
     return all(any(f in t for f in [k.lower(), k.replace(" ", ""), k.replace("-", "")]) for k in kws)
 
 with st.spinner("Filtering resumes..."):
     candidates = []
     for p in pdfs:
         recent, full = extract_text(p)
-        if len(recent) < 100: continue
-        if not has_all_keywords(full, must_have_keywords): continue
+        if len(recent) < 100:
+            continue
+        if not has_all_keywords(full, must_have_keywords):
+            continue
         candidates.append({"file": p.name, "text": recent, "path": str(p)})
     st.write(f"**{len(candidates)} resumes passed filter**")
 
@@ -130,7 +134,8 @@ REASON: 1 short sentence"""
                     "Text": c["text"]
                 })
                 st.success(f"{len(accepted)}. {c['file']} → {score}/100")
-        except: pass
+        except:
+            pass
 
         progress.progress((i + 1) / len(I[0]))
 
@@ -152,7 +157,7 @@ REASON: 1 short sentence"""
         df = df[["Rank", "File", "Score", "Why"]]
         st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-        # === CHAT WITH RESUME (SAFE) ===
+        # === CHAT WITH RESUME ===
         st.markdown("### Talk to Any Resume")
         if accepted:
             selected_name = st.selectbox("Select candidate", [a["File"] for a in accepted])
