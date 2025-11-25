@@ -96,7 +96,7 @@ if st.button("Start AI Screening", type="primary"):
         c = candidates[idx]
         
         # === PERFECT PROMPT — NEVER REJECTS EVERYTHING ===
-        prompt = f"""You are a senior technical recruiter.
+        prompt = f"""You are a senior recruiter.
 
 Job Description:
 {job_description}
@@ -133,7 +133,7 @@ REASON: 1 short sentence"""
             reason = reason_match.group(1).strip() if reason_match else "Good fit"
 
             # ACCEPT if score >= 75
-            if score >= 75:
+            if score >= 61:
                 accepted.append({
                     "File": c["file"],
                     "Path": c["path"],
