@@ -1,354 +1,160 @@
-"""
-Production-ready Streamlit app: Elite Resume Ranker
-Improvements vs original:
-- Robust PDF/text extraction with clear fallbacks and logging
-- Safe ZIP handling (file count / size limits)
-- Regex word-boundary keyword matching
-- Proper boost parsing (regex)
-- FAISS usage with normalized float32 embeddings
-- Optional weighting of boost terms in semantic search
-- Resume summarization before LLM scoring to save tokens
-- Robust LLM response parsing with retries
-- Tesseract auto-detect fallback
-- Caching for embedder
-- Progress and user-friendly spinners/messages
-
-Notes:
-- Expects GROQ_API_KEY in Streamlit secrets.toml as before.
-- Tune THREAD_COUNTS and limits for your deployment environment.
-"""
+# app.py — ELITE RESUME SCREENER 2025
 
 import streamlit as st
-import PyPDF2, re, io, zipfile, pandas as pd, base64, numpy as np, os, math
-from pdf2image import convert_from_bytes
-import pytesseract
-from groq import Groq
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, zipfile, fitz, re, numpy as np, pandas as pd, faiss, base64
 from sentence_transformers import SentenceTransformer
-import faiss
+from groq import Groq
+from pathlib import Path
 import time
-import textwrap
-from typing import List, Tuple
 
-# ========================= CONFIG =========================
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", None)
-if not GROQ_API_KEY:
-    st.warning("GROQ_API_KEY missing in secrets.toml — LLM scoring will be disabled.")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+st.set_page_config(page_title="Elite Resume Screener 2025", layout="wide", page_icon="rocket")
 
-MODEL = "llama-3.1-8b-instant"
+# === CUSTOM CSS FOR ELEGANCE ===
+st.markdown("""
+<style>
+    .main {background: linear-gradient(135deg, #1e1e2e 0%, #2d1b69 100%); color: white;}
+    .stButton>button {background: #00d4ff; color: black; border-radius: 12px; padding: 12px 30px; font-weight: bold;}
+    .stTextInput>div>div>input {background: #2a2a3a; color: white; border-radius: 12px;}
+    .stFileUploader>div>div {background: #3a3a5a; border-radius: 16px; padding: 20px;}
+    .title {font-size: 4rem; font-weight: 900; text-align: center; background: linear-gradient(90deg, #00d4ff, #ff00c8); -webkit-background-clip: text; -webkit-text-fill-color: transparent;}
+    .subtitle {text-align: center; font-size: 1.4rem; opacity: 0.9;}
+    .card {background: rgba(255,255,255,0.1); padding: 20px; border-radius: 16px; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.2);}
+    .chat-bubble {background: #00d4ff; color: black; padding: 12px 20px; border-radius: 20px; max-width: 80%; margin: 10px 0;}
+</style>
+""", unsafe_allow_html=True)
 
-# Tunables
-MAX_ZIP_FILES = 800
-MAX_ZIP_BYTES = 250 * 1024 * 1024  # 250 MB
-EXTRACTION_THREADS = 8  # tune per CPU
-LLM_THREADS = 8
-MAX_CANDIDATES = 220
-FINAL_LLM_TOP = 40
-SUMMARY_CHAR_LIMIT = 2500  # summarise resume to ~2500 chars for LLM scoring
+# === TITLE ===
+st.markdown("<h1 class='title'>Elite Resume Screener 2025</h1>", unsafe_allow_html=True)
+st.markdown("<p class='subtitle'>AI-Powered • Lightning Fast </p>", unsafe_allow_html=True)
 
-# Auto-detect tesseract
-try:
-    if not pytesseract.get_tesseract_version():
-        pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-except Exception:
-    # best-effort; let pytesseract raise later when used
-    pass
+# === SIDEBAR INPUTS ===
+with st.sidebar:
+    st.header("Configuration")
+    job_description = st.text_area("Job Description", height=150, value="Senior Python Developer with FastAPI and AWS")
+    must_have_input = st.text_input("Must-have keywords (comma-separated, optional)", "")
+    must_have_keywords = [k.strip() for k in must_have_input.split(",") if k.strip()]
+    
+    st.markdown("---")
+    uploaded_file = st.file_uploader("Upload ZIP of Resumes", type="zip")
 
-st.set_page_config(page_title="Elite Resume Ranker — Production", layout="wide")
-st.title("⚡ Elite Resume Ranker — Production-ready")
-st.markdown("**Improved reliability, safety, and cost-efficiency**")
+if not uploaded_file:
+    st.info("Please upload a ZIP file to begin.")
+    st.stop()
 
-# ========================= HELPERS & CACHES =========================
-@st.cache_resource
-def load_embedder(model_name: str = 'sentence-transformers/all-MiniLM-L6-v2'):
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    return SentenceTransformer(model_name, device=device)
+# === MAIN PROCESSING ===
+with st.spinner("Extracting resumes..."):
+    extract_folder = "extracted_resumes"
+    os.makedirs(extract_folder, exist_ok=True)
+    with zipfile.ZipFile(uploaded_file) as z:
+        z.extractall(extract_folder)
+    st.success("ZIP extracted!")
 
-embedder = load_embedder()
+pdfs = list(Path(extract_folder).rglob("*.pdf"))
 
-def safe_read_zip(file) -> List[Tuple[str, bytes]]:
-    """Reads zip file contents but enforces file count and size limits to avoid ZIP bombs."""
-    file.seek(0)
-    data = file.read()
-    if len(data) > MAX_ZIP_BYTES:
-        raise ValueError(f"Uploaded zip exceeds maximum allowed size of {MAX_ZIP_BYTES//1024//1024} MB")
-    buf = io.BytesIO(data)
-    with zipfile.ZipFile(buf) as z:
-        names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
-        if len(names) > MAX_ZIP_FILES:
-            raise ValueError(f"Too many PDF files in ZIP ({len(names)}). Max allowed is {MAX_ZIP_FILES}.")
-        items = [(n, z.read(n)) for n in names]
-    return items
-
-
-def extract_text(pdf_bytes: bytes, ocr_first_page_only: bool = True) -> str:
-    """Try: 1) PyPDF2 text extraction 2) If short or empty -> OCR first page 3) return truncated text"""
-    text = ""
+def extract_text(path):
     try:
-        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        for p in reader.pages:
-            # some pages may return None
-            pg = p.extract_text()
-            if pg:
-                text += pg + "\n"
-        text = re.sub(r'\s+', ' ', text).strip()
-        # if sufficient text extracted, return
-        if len(text) > 300:
-            return text[:24000]
-    except Exception as e:
-        # log silently and fallback to OCR
-        st.write(f"PyPDF2 failed: {e}")
+        with fitz.open(path) as doc:
+            text = "".join(p.get_text() for p in doc)
+            return text[-22_000:], text
+    except: return "", ""
 
-    # Fallback: OCR first page
-    try:
-        imgs = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
-        if imgs:
-            text_ocr = pytesseract.image_to_string(imgs[0], config='--psm 6')
-            text_ocr = re.sub(r'\s+', ' ', text_ocr).strip()
-            if text_ocr:
-                # combine with previous if any
-                combined = (text + '\n' + text_ocr).strip()
-                return combined[:24000]
-    except Exception as e:
-        st.write(f"OCR fallback failed: {e}")
+def has_all_keywords(text, kws):
+    if not kws: return True
+    t = text.lower()
+    return all(any(f in t for f in [k.lower(), k.replace(" ", ""), k.replace("-", "")]) for k in kws)
 
-    # Final fallback: return whatever we have or explicit marker
-    if not text:
-        return ""  # explicit empty so downstream can detect
-    return text[:24000]
+st.info(f"Found {len(pdfs)} PDFs. Filtering...")
 
+candidates = []
+for p in pdfs:
+    recent, full = extract_text(p)
+    if len(recent) < 100: continue
+    if not has_all_keywords(full, must_have_keywords): continue
+    candidates.append({"file": p.name, "text": recent, "path": str(p)})
 
-def parse_keywords(text: str) -> List[str]:
-    return re.findall(r"\w+", text.lower())
+st.write(f"**{len(candidates)} resumes passed filter**")
 
+if len(candidates) == 0:
+    st.error("No resumes matched your criteria.")
+    st.stop()
 
-def keyword_score(text: str, jd_tokens: List[str], boost_tokens: List[str]) -> int:
-    """Score using word-boundary matching; boost tokens weighted higher."""
-    text_low = text.lower()
-    score = 0
-    for w in set(jd_tokens):
-        if re.search(rf"\b{re.escape(w)}\b", text_low):
-            score += 1
-    for w in set(boost_tokens):
-        if re.search(rf"\b{re.escape(w)}\b", text_low):
-            score += 3
-    return score
+top_n = st.slider("How many TOP resumes to score with AI?", 1, min(50, len(candidates)), 10)
 
+if st.button("Start AI Screening", type="primary"):
+    with st.spinner("Loading AI model..."):
+        model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
 
-def summarize_for_llm(text: str, char_limit: int = SUMMARY_CHAR_LIMIT) -> str:
-    """A lightweight summarizer: returns the first useful paragraphs up to limit.
-    (We intentionally keep it simple to avoid extra tokens and complexity.)
-    """
-    if not text:
-        return ""
-    # Prefer the top paragraph blocks separated by two newlines
-    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    out = ""
-    for p in paragraphs:
-        if len(out) + len(p) + 2 > char_limit:
-            break
-        out += p + "\n\n"
-    if not out:
-        out = text[:char_limit]
-    return out.strip()
+    with st.spinner("Running semantic search..."):
+        embs = model.encode([c["text"] for c in candidates], normalize_embeddings=True).astype('float32')
+        index = faiss.IndexFlatIP(embs.shape[1])
+        index.add(embs)
+        q = model.encode([job_description], normalize_embeddings=True).astype('float32')
+        faiss.normalize_L2(q)
+        D, I = index.search(q, top_n)
 
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    accepted = []
+    progress = st.progress(0)
 
-def robust_parse_score(resp_text: str) -> Tuple[int, str]:
-    """Try to extract score robustly from LLM response."""
-    if not resp_text:
-        return 30, "Empty LLM response"
-    s = resp_text
-    # normalize
-    s_norm = s.replace('\r', '\n')
-    # search for digits near 'score'
-    m = re.search(r'score[^0-9]{0,6}(\d{1,3})', s_norm, re.I)
-    if not m:
-        m = re.search(r'^(\d{1,3})\b', s_norm)
-    if m:
+    st.write("### Scoring with Groq AI...")
+
+    for i, idx in enumerate(I[0]):
+        c = candidates[idx]
+        prompt = f"""JD: {job_description}\n\nResume:\n{c["text"][:20000]}\n\nReply only:\nSCORE: 0-100\nDECISION: ACCEPT or REJECT\nREASON: 1-2 short sentences why this candidate is a good match"""
+
         try:
-            score = int(m.group(1))
-            score = max(0, min(100, score))
-        except:
-            score = 30
+            resp = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": prompt}], temperature=0, max_tokens=80).choices[0].message.content.strip()
+            score = int(re.search(r"SCORE:\s*(\d+)", resp).group(1))
+            decision = "ACCEPT" if "ACCEPT" in resp.upper() else "REJECT"
+            reason = re.search(r"REASON:\s*(.+)", resp, re.DOTALL)
+            reason = reason.group(1).strip() if reason else "Strong match"
+
+            if decision == "ACCEPT":
+                accepted.append({"File": c["file"], "Path": c["path"], "Score": score, "Why Selected": reason, "Text": c["text"]})
+                st.success(f"{len(accepted)}. {c['file']} → {score}/100")
+        except: pass
+
+        progress.progress((i + 1) / len(I[0]))
+
+    # === FINAL TABLE ===
+    st.markdown("### FINAL ACCEPTED CANDIDATES")
+    if not accepted:
+        st.warning("No candidate was accepted.")
     else:
-        score = 30
-    # reason extraction
-    reason = ""
-    m2 = re.search(r'reason[:\-\s]{1,20}(.+)', s_norm, re.I | re.S)
-    if m2:
-        reason = m2.group(1).strip().split('\n')[0][:200]
-    else:
-        # fallback: first sentence after score
-        parts = re.split(r'\n', s_norm)
-        if len(parts) > 1:
-            reason = parts[1].strip()[:200]
-        else:
-            reason = s_norm.strip()[:200]
-    return score, reason
+        def make_clickable(row):
+            with open(row["Path"], "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            return f'<a href="data:application/pdf;base64,{b64}" download="{row["File"]}">Download {row["File"]}</a>'
 
+        df = pd.DataFrame(accepted)
+        df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+        df["Rank"] = range(1, len(df) + 1)
+        df["File"] = df.apply(make_clickable, axis=1)
+        df = df[["Rank", "File", "Score", "Why Selected"]]
+        st.markdown(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-def call_llm_score(client: Groq, prompt: str, model: str = MODEL, retries: int = 2) -> str:
-    if client is None:
-        return ''
-    for attempt in range(retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.05,
-                max_tokens=180
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            st.write(f"LLM call failed (attempt {attempt}): {e}")
-            time.sleep(0.8 + attempt * 0.5)
-    return ''
+        # === TALK TO RESUME ===
+        st.markdown("### Talk to Any Resume")
+        selected_file = st.selectbox("Choose a resume to chat with", [a["File"] for a in accepted])
+        selected = next(a for a in accepted if a["File"] == selected_file)
 
-# ========================= UI and Main Flow =========================
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
 
-c1, c2 = st.columns([3,1])
-with c1:
-    job_desc = st.text_area("Job Description", height=200, placeholder="e.g. Senior Python Engineer, FastAPI, Docker, AWS...")
-with c2:
-    boost = st.text_input("Boost keywords (comma separated)", placeholder="FastAPI, Docker, AWS, Redis")
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
 
-uploaded_zip = st.file_uploader("Upload ZIP of PDF resumes", type="zip")
+        if prompt := st.chat_input("Ask anything about this resume..."):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.write(prompt)
 
-if st.button("Start Ranking", type="primary"):
-    if not job_desc or not job_desc.strip():
-        st.error("Job Description is required.")
-        st.stop()
-    if not uploaded_zip:
-        st.error("Please upload a ZIP file containing PDF resumes.")
-        st.stop()
-
-    try:
-        files = safe_read_zip(uploaded_zip)
-    except Exception as e:
-        st.error(f"Error reading ZIP: {e}")
-        st.stop()
-
-    st.info(f"Found {len(files)} PDF resumes in ZIP — starting processing.")
-
-    jd_tokens = parse_keywords(job_desc)
-    boost_tokens = parse_keywords(boost) if boost else []
-
-    start_time = time.time()
-
-    # Phase 1: parallel extraction + keyword pre-filter
-    extractor_progress = st.empty()
-    extractor_progress.text("Phase 1: extracting text and keyword filtering...")
-
-    candidates = []
-    with ThreadPoolExecutor(max_workers=min(EXTRACTION_THREADS, max(2, len(files)))) as ex:
-        futures = {ex.submit(lambda t: (t[0], extract_text(t[1])), item): item[0] for item in files}
-        results = []
-        for fut in as_completed(futures):
-            name = futures[fut]
-            try:
-                name, text = fut.result()
-            except Exception as e:
-                st.write(f"Extraction failed for {name}: {e}")
-                text = ""
-            score = keyword_score(text, jd_tokens, boost_tokens) if text else 0
-            results.append((name, text, score))
-
-    # sort by keyword score and keep top N
-    results.sort(key=lambda x: x[2], reverse=True)
-    survivors = results[:MAX_CANDIDATES]
-    extractor_progress.text(f"Phase 1 done — {len(survivors)} survivors. Time: {int(time.time()-start_time)}s")
-
-    # Phase 2: semantic ranking using embeddings + FAISS
-    sem_progress = st.empty()
-    sem_progress.text("Phase 2: semantic ranking (embeddings + FAISS)...")
-
-    texts = [r[1] if r[1] else "" for r in survivors]
-    # Create embeddings in batches
-    try:
-        embeddings = embedder.encode([t if t else "" for t in texts], batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-        embeddings = np.array(embeddings).astype('float32')
-    except Exception as e:
-        st.error(f"Embedding error: {e}")
-        st.stop()
-
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
-
-    # Query embedding: consider weighting boost tokens by repeating them
-    query_text = job_desc
-    if boost_tokens:
-        # append boost tokens repeated to give them extra weight
-        query_text = job_desc + ' ' + ' '.join(boost_tokens * 3)
-    q_emb = embedder.encode([query_text], normalize_embeddings=True).astype('float32')
-
-    k = min(40, len(survivors))
-    D, I = index.search(q_emb, k)
-    ranked = [survivors[i] for i in I[0]]
-    sem_progress.text(f"Phase 2 done — semantic top {len(ranked)} selected. Time: {int(time.time()-start_time)}s")
-
-    # Phase 3: Final scoring with LLM (on summarized text to save tokens)
-    llm_progress = st.empty()
-    llm_progress.text("Phase 3: final scoring with LLM (summarized inputs)...")
-
-    # Prepare PDF bytes lookup for download later
-    # Re-open zip to fetch PDFs as bytes for top candidates
-    uploaded_zip.seek(0)
-    zip_buf = io.BytesIO(uploaded_zip.read())
-    with zipfile.ZipFile(zip_buf) as z:
-        name_to_bytes = {n: z.read(n) for n in z.namelist() if n.lower().endswith('.pdf')}
-
-    final_items = ranked[:FINAL_LLM_TOP]
-    results_for_df = []
-
-    def score_item(name, text):
-        summary = summarize_for_llm(text)
-        prompt = f"""Score 0-100 how well this resume matches the JD. Reply EXACTLY in this format:\nSCORE: <integer 0-100>\nREASON: <one short sentence>\n\nJD: {job_desc}\nBOOST: {boost}\n\nResumeSummary: {summary}\n\nIf you cannot score, return SCORE: 30 and REASON: Unable to evaluate."""
-        resp = call_llm_score(client, prompt)
-        score, reason = robust_parse_score(resp)
-        return score, reason
-
-    # Use ThreadPoolExecutor but limit concurrency to control API usage
-    with ThreadPoolExecutor(max_workers=min(LLM_THREADS, max(1, len(final_items)))) as ex:
-        future_to_name = {ex.submit(score_item, itm[0], itm[1]): itm[0] for itm in final_items}
-        for fut in as_completed(future_to_name):
-            name = future_to_name[fut]
-            try:
-                score, reason = fut.result()
-            except Exception as e:
-                st.write(f"LLM scoring failed for {name}: {e}")
-                score, reason = 30, "LLM error"
-            pdf_bytes = name_to_bytes.get(name, b"")
-            results_for_df.append({"File": name, "Score": score, "Why": reason, "PDF": pdf_bytes})
-
-    df = pd.DataFrame(results_for_df).sort_values("Score", ascending=False).reset_index(drop=True)
-    if df.empty:
-        st.error("No scored resumes — nothing to show.")
-        st.stop()
-
-    df["Rank"] = range(1, len(df) + 1)
-
-    st.success(f"Done in {int(time.time()-start_time)} seconds — Top: {df.iloc[0]['File']} ({df.iloc[0]['Score']})")
-
-    def link(n, d):
-        return f'<a href="data:application/pdf;base64,{base64.b64encode(d).decode()}" download="{n}" style="color:#0066cc;font-weight:600;">{n}</a>'
-
-    df["Candidate"] = df.apply(lambda r: link(r["File"], r["PDF"]), axis=1)
-
-    st.markdown(df[["Rank", "Candidate", "Score", "Why"]].to_html(escape=False, index=False), unsafe_allow_html=True)
-
-    # Download top N
-    TOP_N = 20
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        for _, r in df.head(TOP_N).iterrows():
-            name = f"{int(r['Score']):03d}_{r['File']}"
-            z.writestr(name, r['PDF'])
-    buf.seek(0)
-    st.download_button("📥 Download Top 20 Ranked Resumes", buf, "TOP20_FINAL.zip", "application/zip", use_container_width=True)
+            chat_prompt = f"""Answer ONLY from this resume:\n{selected["Text"][:25000]}\n\nQuestion: {prompt}\nAnswer briefly:"""
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    resp = client.chat.completions.create(model="llama-3.1-8b-instant", messages=[{"role": "user", "content": chat_prompt}], temperature=0.3, max_tokens=200).choices[0].message.content
+                    st.write(resp)
+                    st.session_state.messages.append({"role": "assistant", "content": resp})
 
     st.balloons()
-
-# End of app
